@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: O2-MAGVIT2
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: misc
+authors:
+  - given-names: Xuezhi
+    family-names: Fang
+  - given-names: Yiqun
+    family-names: Yao
+  - given-names: Xin
+    family-names: Jiang
+  - given-names: Xiang
+    family-names: Li
+  - given-names: Naitong
+    family-names: Yu
+  - given-names: Yequan
+    family-names: Wang
+repository-code: 'https://github.com/cofe-ai/O2-MAGVIT2'
+abstract: >-
+  Open Source Implementation of Dual Modality MAGVIT2
+  Tokenizer
+license: Apache-2.0
