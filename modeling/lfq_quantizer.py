@@ -194,6 +194,7 @@ class LFQ(Module):
         x,
         inv_temperature = 100.,
         entropy_loss_weight = 0.1,
+        calculate_loss=True,
         return_loss_breakdown = False,
         mask = None,
         use_distributed_batch_entropy: bool=True,
@@ -252,7 +253,7 @@ class LFQ(Module):
             else:
                 x = quantized
 
-            if self.training:
+            if self.training and calculate_loss:
 
                 if force_f32:
                     codebook = self.codebook.float()
@@ -261,7 +262,10 @@ class LFQ(Module):
                 if self.spherical:
                     codebook = l2norm(codebook) * self.codebook_scale
                 distance = -2 * einsum('... i d, j d -> ... i j', original_input, codebook)
-                entropy_aux_loss, per_sample_entropy, codebook_entropy = calculate_entropy_loss(-distance, sample_minimization_weight=1.0, batch_maximization_weight=self.diversity_gamma, use_distributed_batch_entropy=use_distributed_batch_entropy)
+                entropy_aux_loss, per_sample_entropy, codebook_entropy = calculate_entropy_loss(-distance, sample_minimization_weight=1.0, 
+                                                                                                batch_maximization_weight=self.diversity_gamma, 
+                                                                                                use_distributed_batch_entropy=use_distributed_batch_entropy
+                                                                                                )
 
             else:
                 entropy_aux_loss = per_sample_entropy = codebook_entropy = self.zero
@@ -271,7 +275,7 @@ class LFQ(Module):
 
             # commit loss
 
-            if self.training and self.commitment_loss_weight > 0.:
+            if self.training and calculate_loss and self.commitment_loss_weight > 0.:
 
                 commit_loss = F.mse_loss(original_input, quantized.detach(), reduction = 'none')
 
