@@ -6,7 +6,7 @@ from modeling.discriminator import StyleGANDiscriminator3D
 from modeling.discriminator_2d import StyleGANDiscriminator2D
 from src import losses
 from torch import nn
-from torchvision.models import resnet50
+from torchvision.models import resnet50, vgg16
 import torch.nn.functional as F
 from collections import namedtuple
 from einops import rearrange
@@ -14,11 +14,7 @@ from contextlib import contextmanager
 import torch
 import time
 
-LossBreakdown = namedtuple('LossBreakdown', [
-    'recon_loss',
-    'quantize_aux_loss',
-    'quantizer_loss_breakdown',
-])
+
 
 GenLossBreakdown = namedtuple('GenLossBreakdown', [
     'recon_loss',
@@ -93,14 +89,14 @@ class VisionTokenizerModule(nn.Module):
         else:
             raise NotImplementedError("quantizer type not implemented yet.")
 
-    def encode(self, x, entropy_loss_weight=0.1, use_distributed_batch_entropy=None):
+    def encode(self, x, entropy_loss_weight=0.1, use_distributed_batch_entropy=None, calculate_quantize_loss=True):
         z = self.encoder(x)
         h, w = z.shape[-2:]
         if self.modal == "image":
             z_flattened = rearrange(z, "b c h w -> b (h w) c")
         elif self.modal == "video":
             z_flattened = rearrange(z, "b c t h w -> b (t h w) c")
-        quantized_output, loss_breakdown = self.quantize(z_flattened, entropy_loss_weight=entropy_loss_weight, return_loss_breakdown=True, use_distributed_batch_entropy=use_distributed_batch_entropy)
+        quantized_output, loss_breakdown = self.quantize(z_flattened, entropy_loss_weight=entropy_loss_weight, calculate_loss=calculate_quantize_loss, return_loss_breakdown=True, use_distributed_batch_entropy=use_distributed_batch_entropy)
         if self.modal == "image":
             z_quantized = rearrange(quantized_output.quantized, "b (h w) c -> b c h w", h=h, w=w)
         elif self.modal == "video":
@@ -111,8 +107,8 @@ class VisionTokenizerModule(nn.Module):
         decoded_pixel_output = self.decoder(*args)
         return decoded_pixel_output
 
-    def forward(self, x, entropy_loss_weight: float):
-        z_quantized, quantized_output, quantize_loss_breakdown = self.encode(x, entropy_loss_weight)
+    def forward(self, x, entropy_loss_weight: float, calculate_quantize_loss=True):
+        z_quantized, quantized_output, quantize_loss_breakdown = self.encode(x, entropy_loss_weight, calculate_quantize_loss)
         decoded_pixel_output = self.decode(z_quantized)
         return decoded_pixel_output, z_quantized, quantized_output, quantize_loss_breakdown
 
@@ -173,7 +169,8 @@ class VisionTokenizer(nn.Module):
 
     def prepare_perceptual(self, ckpt_path):
         weights = torch.load(ckpt_path, map_location="cpu")
-        model = resnet50()
+        # model = resnet50()
+        model = vgg16()
         model.load_state_dict(weights)
         model.eval()
         for param in model.parameters():
@@ -217,12 +214,13 @@ class VisionTokenizer(nn.Module):
         loss_breakdown = DiscriLossBreakdown(lecam_reg_loss=lecam_loss, d_adversarial_loss=d_adversarial_loss, gradient_penalty_loss=gradient_penalty_loss)
         return discri_loss, loss_breakdown
 
-    def _forward_generator(self, recon_output: torch.Tensor, recon_loss, quantize_loss, perceptual_loss, generator_loss_type, loss_weights):
+    def _forward_generator(self, input_data, recon_output: torch.Tensor, recon_loss, quantize_loss, generator_loss_type, loss_weights):
         
         gen_loss = recon_loss * loss_weights["recon_loss_weight"]
         if quantize_loss is not None:
             gen_loss += quantize_loss * loss_weights["quantizer_aux_loss_weight"]
-        if perceptual_loss is not None:
+        if self.use_perceptual:
+            perceptual_loss = self._forward_perceptual(input_data=input_data, recon_output=recon_output)
             gen_loss += perceptual_loss * loss_weights["perceptual_loss_weight"]
         fake_logit = self.discriminator(recon_output)
         g_adversarial_loss = losses.generator_loss(
@@ -243,46 +241,38 @@ class VisionTokenizer(nn.Module):
         perceptual_loss = losses.calculate_perceptual_loss(real_perceptual_inputs, fake_perceptual_inputs, self.perceptual_model)
         return perceptual_loss
 
-    def forward(self, x, run_generator=False, run_discriminator=False, apply_gradient_penalty=False, discriminator_loss_type=None, generator_loss_type=None, loss_weights: dict=None, use_distributed_batch_entropy=None):
-        assert (run_generator and run_discriminator) == False, "cannot update generator and discriminator at the same time"
-        run_reconstruction_model_only = not (run_generator or run_discriminator)
-
-        z_quantized, quantized_output, quantize_loss_breakdown = self.tokenizer.encode(x, entropy_loss_weight=loss_weights["quantizer_entropy_loss_weight"], use_distributed_batch_entropy=use_distributed_batch_entropy)
+    def _forward_reconstruction(self, input_data, calculate_loss=False, loss_weights: dict=None, use_distributed_batch_entropy=False):
+        z_quantized, quantized_output, quantize_loss_breakdown = self.tokenizer.encode(input_data, entropy_loss_weight=loss_weights["quantizer_entropy_loss_weight"], use_distributed_batch_entropy=use_distributed_batch_entropy, calculate_quantize_loss=calculate_loss)
         decoded_pixel_output = self.tokenizer.decode(z_quantized)
 
         if self.skip_quantize:
             quantize_loss = None
+            quantized_token_ids = []
         else:
             quantized_token_ids =  quantized_output.indices
             quantize_loss = quantized_output.entropy_aux_loss
 
+        if calculate_loss:
+            recon_loss = F.mse_loss(input_data, decoded_pixel_output)
+        else:
+            recon_loss = None
+        return decoded_pixel_output, quantized_token_ids, recon_loss, quantize_loss, quantize_loss_breakdown
 
-        if run_reconstruction_model_only or run_generator:
-            recon_loss = F.mse_loss(x, decoded_pixel_output)
 
-        if run_reconstruction_model_only:
-            total_loss = recon_loss * loss_weights["recon_loss_weight"]
-            if quantize_loss is not None:
-                total_loss += quantize_loss * loss_weights["quantizer_aux_loss_weight"]
-            loss_breakdown = LossBreakdown(
-                recon_loss,
-                quantize_loss,
-                quantize_loss_breakdown
-            )
-        elif run_generator:
-            if self.use_perceptual:
-                perceptual_loss = self._forward_perceptual(input_data=x, recon_output=decoded_pixel_output)
-            else:
-                perceptual_loss = None
-            total_loss, loss_breakdown = self._forward_generator(recon_output=decoded_pixel_output,
-                                                                 recon_loss=recon_loss,
-                                                                 quantize_loss=quantize_loss,
-                                                                 perceptual_loss=perceptual_loss,
-                                                                 generator_loss_type=generator_loss_type,
-                                                                 loss_weights=loss_weights)
+    def forward(self, forward_mode: str, **forward_kwargs): 
+        """
+        Parameters:
+        - forward_mode (str): Determines the mode of operation for the forward method.
+                            Acceptable values are ["reconstruction", "generator", "discriminator"].
+        - *forward_args: Positional arguments for the forward method.
+        - **forward_kwargs: Keyword arguments for the forward method.
+        """
+        if forward_mode == "reconstruction":
+            return self._forward_reconstruction(**forward_kwargs)
+        elif forward_mode == "generator":
+            return self._forward_generator(**forward_kwargs)
+        elif forward_mode == "discriminator":
+            return self._forward_discriminator(**forward_kwargs)
+        else:
+            raise NotImplementedError(f"unsuported {forward_mode}")
 
-        else: # run discriminator
-            # we only needs its output, not the grads, use detach & clone to save memory
-            decoded_pixel_output = torch.clone(decoded_pixel_output.detach())
-            total_loss, loss_breakdown = self._forward_discriminator(input_data=x, recon_output=decoded_pixel_output, apply_gradient_penalty=apply_gradient_penalty, discriminator_loss_type=discriminator_loss_type, loss_weights=loss_weights)
-        return decoded_pixel_output, quantized_token_ids, total_loss, loss_breakdown, quantize_loss_breakdown
