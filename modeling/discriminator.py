@@ -128,14 +128,14 @@ class ResBlockDown(nn.Module):
         self.conv1 = nn.Conv3d(
             in_channels, in_channels, (3, 3, 3), padding="same", padding_mode=PADDING_MODE
         )
-        self.norm1 = GroupNormSpatial(num_groups, in_channels)
+        # self.norm1 = GroupNormSpatial(num_groups, in_channels)
 
         self.blur = BlurPool3D(in_channels, filt_size=3, stride=2)
 
         self.conv2 = nn.Conv3d(in_channels, self.filters, (1, 1, 1), bias=False, padding_mode=PADDING_MODE)
         self.conv3 = nn.Conv3d(
             in_channels, self.filters, (3, 3, 3), padding="same", padding_mode=PADDING_MODE)
-        self.norm2 = GroupNormSpatial(num_groups, self.filters)
+        # self.norm2 = GroupNormSpatial(num_groups, self.filters)
         
 
 
@@ -144,14 +144,9 @@ class ResBlockDown(nn.Module):
         x = self.conv1(x)
         # x = self.norm1(x)
         x = self.activation_fn(x)
-
-        residual = self.blur(residual)
-
-        residual = self.conv2(residual)
-
-
         x = self.blur(x)
-
+        residual = self.blur(residual)
+        residual = self.conv2(residual)
         x = self.conv3(x)
         # x = self.norm2(x)
         x = self.activation_fn(x)
@@ -174,7 +169,7 @@ class StyleGANDiscriminator3D(nn.Module):
             *[ResBlockDown(in_channels=input_channels[i], filters=self.channel_multipliers[i] * self.filters, activation_fn=self.activation_fn) for i in range(len(self.channel_multipliers))]
         )
 
-        self.norm_fn = GroupNormSpatial(32, self.filters * self.channel_multipliers[-1])
+        # self.norm_fn = GroupNormSpatial(32, self.filters * self.channel_multipliers[-1])
         self.conv_out = nn.Conv3d(
             self.filters * self.channel_multipliers[-1], 
             self.filters * self.channel_multipliers[-1], 
@@ -209,7 +204,7 @@ class StyleGANDiscriminator3D(nn.Module):
         x = self.activation_fn(x)
         x = self.res_blocks(x)
         x = self.conv_out(x)
-        x = self.norm_fn(x)
+        # x = self.norm_fn(x)
         x = self.activation_fn(x)
         x = x.view(x.shape[0], -1)
         assert self.logit_input_feats == x.shape[1]

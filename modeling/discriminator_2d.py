@@ -51,8 +51,8 @@ class BlurPool2D(nn.Module):
 
         filt = torch.Tensor(a[:,None]*a[None,:])
         filt = filt/torch.sum(filt)
-        self.filt = filt[None,None,:,:].repeat((self.channels,1,1,1))
-        self.filt.requires_grad_(False)
+        self.register_buffer("filt", filt[None,None,:,:].repeat((self.channels,1,1,1)))
+
         self.pad = get_pad_layer(pad_type)(self.pad_sizes)
 
     def forward(self, inp):
@@ -88,14 +88,14 @@ class ResBlockDown(nn.Module):
         self.conv1 = nn.Conv2d(
             in_channels, in_channels, (3, 3), padding=1, padding_mode=PADDING_MODE
         )
-        self.norm1 = GroupNormSpatial(num_groups, in_channels)
+        # self.norm1 = GroupNormSpatial(num_groups, in_channels)
 
         self.blur = BlurPool2D(in_channels, filt_size=3, stride=2)
 
         self.conv2 = nn.Conv2d(in_channels, self.filters, (1, 1), bias=False, padding=0)
         self.conv3 = nn.Conv2d(
             in_channels, self.filters, (3, 3), padding=1, padding_mode=PADDING_MODE)
-        self.norm2 = GroupNormSpatial(num_groups, self.filters)
+        # self.norm2 = GroupNormSpatial(num_groups, self.filters)
         
 
     def forward(self, x):
@@ -103,10 +103,8 @@ class ResBlockDown(nn.Module):
         x = self.conv1(x)
         x = self.activation_fn(x)
         x = self.blur(x)
-
         residual = self.blur(residual)
         residual = self.conv2(residual)
-
         x = self.conv3(x)
         x = self.activation_fn(x)
         out = (residual + x) / math.sqrt(2)
@@ -127,7 +125,7 @@ class StyleGANDiscriminator2D(nn.Module):
             *[ResBlockDown(in_channels=input_channels[i], filters=self.channel_multipliers[i] * self.filters, activation_fn=self.activation_fn) for i in range(len(self.channel_multipliers))]
         )
 
-        self.norm_fn = GroupNormSpatial(32, self.filters * self.channel_multipliers[-1], epsilon=1e-5)
+        # self.norm_fn = GroupNormSpatial(32, self.filters * self.channel_multipliers[-1], epsilon=1e-5)
         self.conv_out = nn.Conv2d(
             self.filters * self.channel_multipliers[-1], 
             self.filters * self.channel_multipliers[-1], 
@@ -161,7 +159,7 @@ class StyleGANDiscriminator2D(nn.Module):
         x = self.activation_fn(x)
         x = self.res_blocks(x)
         x = self.conv_out(x)
-        x = self.norm_fn(x)
+        # x = self.norm_fn(x)
         x = self.activation_fn(x)
         x = x.view(x.shape[0], -1)
         assert self.logit_input_feats == x.shape[1]
