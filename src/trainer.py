@@ -19,10 +19,10 @@ import time
 from omegaconf import OmegaConf
 import torch.nn.functional as F
 import gc
-import pathlib
-
+from collections import namedtuple
 from safetensors.torch import load_model
-
+import pathlib
+import random
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,backend:native"
 def cycle(dl):
     while True:
@@ -91,7 +91,7 @@ class VideoTokenizerTrainer:
         self.quantizer_type = (self.model_config.model.quantize_model.quantizer_type).lower()
 
         grad_accum_plugin = GradientAccumulationPlugin(num_steps=self.trainer_config.optimizer.grad_accum_size, sync_each_batch=True, sync_with_dataloader=False)
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True, static_graph=False, broadcast_buffers=False)
 
         self.accelerator = Accelerator(log_with="tensorboard", 
                                        project_dir=self.trainer_config.logging.tensorboard_dir,gradient_accumulation_plugin=grad_accum_plugin,
@@ -156,6 +156,12 @@ class VideoTokenizerTrainer:
 
 
         self.train_dataloader, self.valid_dataloader, self.model, self.gen_optimizer, self.discri_optimizer = self.accelerator.prepare(*accelerator_to_prepare)  
+        
+        if self.use_ema:
+            tokenizer = self.model.module.tokenizer if self.accelerator.num_processes > 1 else self.model.tokenizer
+            self.ema_model = EMA(tokenizer, decay=self.trainer_config.ema.decay_rate)
+            self.ema_model.to(self.accelerator.device)
+        
         # del accelerator_to_prepare
         self.accelerator.register_for_checkpointing(self.gen_lr_scheduler, self.discri_lr_scheduler)
         self.accelerator.register_save_state_pre_hook(self.save_state_pre_hook)
@@ -167,10 +173,13 @@ class VideoTokenizerTrainer:
         if self.trainer_config.checkpointing.pretrained is not None:
             if self.trainer_config.checkpointing.continue_training is True:
                 self.accelerator.load_state(self.trainer_config.checkpointing.pretrained)
+                pretrained_root_dir = pathlib.Path(self.trainer_config.checkpointing.pretrained).parent
+                ema_state = torch.load(os.path.join(pretrained_root_dir, f"iter_{self.step}_ema.ckpt"))
+                self.ema_model.load_state_dict(ema_state)
                 self.continue_training = True
             else:
                 # reset 
-                load_model(self.model.module.tokenizer, self.trainer_config.checkpointing.pretrained)
+                load_model(self.model.module if self.accelerator.num_processes > 1 else self.model, self.trainer_config.checkpointing.pretrained, strict=False)
                 self.continue_training = False
             self.print_global_rank_0(f"successfully load from pretrained {self.trainer_config.checkpointing.pretrained}")
 
@@ -178,10 +187,7 @@ class VideoTokenizerTrainer:
             self.continue_training = False
 
 
-        if self.use_ema:
-            tokenizer = self.model.module.tokenizer if self.accelerator.num_processes > 1 else self.model.tokenizer
-            self.ema_model = EMA(tokenizer, decay=self.trainer_config.ema.decay_rate)
-            self.ema_model.to(self.accelerator.device)
+
 
         self.ckpt_base_dir = os.path.join(self.trainer_config.io.ckpt_base_dir, self.trainer_config.exp_name)
         
@@ -239,63 +245,121 @@ class VideoTokenizerTrainer:
     def train_step(self, batch):
         data, index_strs = batch
         self.print_global_rank_0(f"RECORD: step {self.step}, indices: {list(map(int, index_strs))}")
+
         # ====
         with self.accelerator.accumulate(self.model):
+
             is_gradient_accum_boundary = (self.accelerator.step % (self.accelerator.gradient_accumulation_steps)== 0)
 
             quantizer_entropy_loss_weight = self.entropy_weight_scheduler.step(self.step)
+
+            # **** run reconstruction ****
             loss_weights = {
                 "recon_loss_weight": self.trainer_config.recon_loss_weight,
                 "quantizer_entropy_loss_weight": quantizer_entropy_loss_weight,
                 "quantizer_aux_loss_weight": self.trainer_config.quantizer.aux_loss_weight
             }
-
-            if not self.use_gan:
-                run_generator=False,
-                run_discriminator=False,
-                apply_gradient_penalty=False,
-            else:
-                run_generator = (self.step % 2 == 0)
-                run_discriminator = not run_generator
-
-                if run_generator:
-                    self.print_global_rank_0("run generator!!!")
-                    apply_gradient_penalty = False
-                    loss_weights.update(
-                        {
-                            "g_adversarial_loss_weight": self.trainer_config.gan["g_adversarial_loss_weight"],
-                            "perceptual_loss_weight": self.trainer_config.perceptual["perceptual_loss_weight"],
-                        }
-                    )
-                else: # run discriminator
-                    self.print_global_rank_0("run discriminator!!!")
-
-                    apply_gradient_penalty = self.apply_gradient_penalty and is_gradient_accum_boundary
-
-                    loss_weights.update(
-                        {
-                            "lecam_loss_weight": self.trainer_config.gan["lecam_loss_weight"],
-                            "gradient_penalty_cost": self.trainer_config.gan["gradient_penalty_cost"],
-                            "d_adversarial_loss_weight": self.trainer_config.gan["d_adversarial_loss_weight"]
-                         }
-                    )
-            forward_s = time.time()
-            recon_output, indices, total_loss, loss_breakdown, quantize_loss_breakdown = self.model(
-                data,
-                run_generator=run_generator,
-                run_discriminator=run_discriminator,
-                apply_gradient_penalty=apply_gradient_penalty,
-                discriminator_loss_type=self.trainer_config.gan.discriminator_loss_type,
-                generator_loss_type=self.trainer_config.gan.generator_loss_type,
+            recon_forward_s = time.perf_counter()
+            recon_output, indices, recon_loss, quantize_loss, quantize_loss_breakdown = self.model.forward(
+                forward_mode="reconstruction",
+                input_data=data,
+                calculate_loss=True,
                 loss_weights=loss_weights,
-                use_distributed_batch_entropy=self.trainer_config.quantizer.use_distributed_batch_entropy
+                use_distributed_batch_entropy=self.trainer_config.quantizer.use_distributed_batch_entropy,
             )
-            foward_e = time.time()
+            recon_forward_e = time.perf_counter()
+            recon_forward_cost = recon_forward_e - recon_forward_s
 
-            loss_breakdowns = [loss_breakdown]
-            if (not self.use_gan) or (run_generator): 
-                loss_breakdowns.append(quantize_loss_breakdown)
+            loss_breakdowns = [quantize_loss_breakdown]
+            # **** run generator ****
+            self.print_global_rank_0("run generator!!!")
+            loss_weights.update(
+                {
+                    "g_adversarial_loss_weight": self.trainer_config.gan["g_adversarial_loss_weight"],
+                    "perceptual_loss_weight": self.trainer_config.perceptual["perceptual_loss_weight"],
+                }
+            )
+            # ---- forward ----
+            gen_forward_s = time.perf_counter()
+            gen_loss, loss_breakdown = self.model.forward(
+                                        forward_mode="generator",
+                                        input_data=data, 
+                                        recon_output=recon_output,
+                                        recon_loss=recon_loss, 
+                                        quantize_loss=quantize_loss,
+                                        generator_loss_type=self.trainer_config.gan.generator_loss_type,
+                                        loss_weights=loss_weights,
+                                    )    
+            gen_forward_e = time.perf_counter()
+            gen_forward_cost = gen_forward_e - gen_forward_s
+            loss_breakdowns.append(loss_breakdown)
 
+            # ---- backward ----
+            self.gen_optimizer.zero_grad()
+            self.accelerator.backward(gen_loss)
+            
+            if is_gradient_accum_boundary:
+
+                should_skip_current_step = (self.accelerator.optimizer_step_was_skipped or torch.isnan(gen_loss))
+                if not should_skip_current_step:
+                    if self.trainer_config.max_grad_norm is not None:
+                        self.print_global_rank_0(f"clip grad norm to {self.trainer_config.max_grad_norm}...")
+                        self.accelerator.clip_grad_norm_(self.model.module.tokenizer.parameters(), self.trainer_config.max_grad_norm)
+                    last_gen_lr = self.gen_lr_scheduler.get_last_lr()[0]
+                    self.gen_optimizer.step()
+                    self.gen_lr_scheduler.step()
+
+                    if self.use_ema:
+                        self.ema_model.update(self.model.module.tokenizer if self.accelerator.num_processes > 1 else self.model.tokenizer, step=self.step)
+                else:
+                    self.print_global_rank_0("[WARN] generator optimizer_step_was_skipped! ")
+            gen_loss = gen_loss.detach()
+
+            # **** run discriminator ****
+            self.print_global_rank_0("run discriminator!!!")
+            loss_weights.update(
+                {
+                    "lecam_loss_weight": self.trainer_config.gan["lecam_loss_weight"],
+                    "gradient_penalty_cost": self.trainer_config.gan["gradient_penalty_cost"],
+                    "d_adversarial_loss_weight": self.trainer_config.gan["d_adversarial_loss_weight"]
+                    }
+            )
+            recon_output = torch.clone(recon_output.detach()) # to save memory
+            # ---- forward ----
+            disc_forward_s = time.perf_counter()
+
+            disc_loss, loss_breakdown = self.model.forward(
+                forward_mode="discriminator",
+                input_data=data,
+                recon_output=recon_output,
+                apply_gradient_penalty=self.apply_gradient_penalty,
+                discriminator_loss_type=self.trainer_config.gan.discriminator_loss_type,
+                loss_weights=loss_weights,
+            )
+
+            disc_forward_e = time.perf_counter()
+            disc_forward_cost = disc_forward_e - disc_forward_s
+            loss_breakdowns.append(loss_breakdown)
+
+            # ---- backward ----
+            self.discri_optimizer.zero_grad()
+
+            self.accelerator.backward(disc_loss)
+            if is_gradient_accum_boundary:
+                should_skip_current_step = (self.accelerator.optimizer_step_was_skipped or torch.isnan(disc_loss))
+                if not should_skip_current_step:
+                    if self.trainer_config.max_grad_norm is not None:
+                        self.print_global_rank_0(f"clip grad norm to {self.trainer_config.max_grad_norm}...")
+                        self.accelerator.clip_grad_norm_(self.model.module.discriminator.parameters(), self.trainer_config.max_grad_norm)
+
+                    last_disc_lr = self.discri_lr_scheduler.get_last_lr()[0]
+                    self.discri_optimizer.step()
+                    self.discri_lr_scheduler.step()
+                else:
+                    self.print_global_rank_0("[WARN] discriminator optimizer_step_was_skipped! ")
+            disc_loss = disc_loss.detach()
+
+            # **** logging ****
             tracker_dict = dict()
             for loss_group in loss_breakdowns:
                 loss_type = type(loss_group).__name__
@@ -305,6 +369,8 @@ class VideoTokenizerTrainer:
                     tracker_prefix = "generator/"
                 elif loss_type == "DiscriLossBreakdown":
                     tracker_prefix = "discriminator/"
+                elif loss_type == "EncDecLossBreakdown":
+                    tracker_prefix = "encdec/"
                 else:
                     raise NotImplementedError
                 for field, value in zip(loss_group._fields, loss_group):
@@ -312,7 +378,6 @@ class VideoTokenizerTrainer:
                         avg_val = self.accelerator.gather_for_metrics(value).mean()
                         tracker_dict[tracker_prefix+field] = avg_val.item()
             self.tracker.log(
-                
                 tracker_dict, step=self.step
             )
 
@@ -321,63 +386,35 @@ class VideoTokenizerTrainer:
             if self.quantizer_type == "lfq":
                 self.tracker.log({
                     "quantize/diversity_gamma": self.trainer_config.quantizer.diversity_gamma}, step=self.step)
-            self.accelerator.backward(total_loss)
 
-            if (not self.use_gan) or (run_generator):
-                with torch.no_grad():
-                    tokens_per_batch = self.accelerator.gather_for_metrics(indices.detach().reshape(-1))
-                    unique_tokens_per_batch = tokens_per_batch.unique().tolist()
-                    self.tracker.log({"train/batch_unique_code_ratio": round(len(unique_tokens_per_batch) / min(self.codebook_size, len(tokens_per_batch.tolist())), 4)}, step=self.step)
-                    del tokens_per_batch, unique_tokens_per_batch
+            with torch.no_grad():
+                tokens_per_batch = self.accelerator.gather_for_metrics(indices.detach().reshape(-1))
+                unique_tokens_per_batch = tokens_per_batch.unique().tolist()
+                self.tracker.log({"train/batch_unique_code_ratio": round(len(unique_tokens_per_batch) / min(self.codebook_size, len(tokens_per_batch.tolist())), 4)}, step=self.step)
+                del tokens_per_batch, unique_tokens_per_batch
+
             if is_gradient_accum_boundary:
-                last_gen_lr = self.gen_lr_scheduler.get_last_lr()[0]
-                last_disc_lr = self.discri_lr_scheduler.get_last_lr()[0]
-
-                should_skip_current_step = (self.accelerator.optimizer_step_was_skipped or torch.isnan(total_loss))
-                if not should_skip_current_step:
-                    if self.trainer_config.max_grad_norm is not None:
-                        self.print_global_rank_0("clip grad norm to 1.0...")
-                        if run_generator:
-                            self.accelerator.clip_grad_norm_(self.model.module.tokenizer.parameters(), self.trainer_config.max_grad_norm)
-                        elif run_discriminator:
-                            self.accelerator.clip_grad_norm_(self.model.module.discriminator.parameters(), self.trainer_config.max_grad_norm)
-
-                    if run_generator:
-                        self.gen_optimizer.step()
-                        self.gen_optimizer.zero_grad()
-                        self.gen_lr_scheduler.step()
-
-                    elif run_discriminator:
-                        self.discri_optimizer.step()
-                        self.discri_optimizer.zero_grad()
-                        self.discri_lr_scheduler.step()
-
-                    if self.use_ema and ((not self.use_gan) or run_generator):
-                        self.ema_model.update(self.model.module.tokenizer if self.accelerator.num_processes > 1 else self.model.tokenizer, step=self.step)
-                else:
-                    if run_generator:
-                        self.gen_optimizer.zero_grad()
-                    elif run_discriminator:
-                        self.discri_optimizer.zero_grad()
-                    self.print_global_rank_0("[WARN] optimizer_step_was_skipped! ")
                 self.step += 1
-
                 if self.accelerator.process_index == 0:
-                    self.time_e = time.time()
+                    self.time_e = time.perf_counter()
                     duration = round(self.time_e - self.time_s, 2)
                     self.accum_duration += duration
                     if self.step % 100 == 0:
                         self.print_global_rank_0(f"time consumed for 100 step: {self.accum_duration} seconds")
                     self.time_s = self.time_e
-                    info = {"global_step": self.step, "micro_step": self.accelerator.step, "epoch": self.epoch, "duration": duration, "forward_time": round(foward_e - forward_s, 4)}
-                    self.print_global_rank_0(f">> TRAINING INFO: {json.dumps(info)}")
-                if run_generator:
-                    self.tracker.log({"train/generator_lr": last_gen_lr}, step=self.step)
-                elif run_discriminator:
-                    self.tracker.log({"train/discriminator_lr": last_disc_lr}, step=self.step)
-                else:
-                    pass
-
+                    info = {"global_step": self.step, 
+                            "micro_step": self.accelerator.step, 
+                            "epoch": self.epoch, 
+                            "duration": duration, 
+                            "recon_forward_time": round(recon_forward_cost, 4),
+                            "disciminator_forward_time": round(disc_forward_cost, 4),
+                            "generator_forward_time": round(gen_forward_cost, 4)
+                            }
+                    if self.step % 10 == 0:
+                        self.print_global_rank_0(f">> TRAINING INFO: {json.dumps(info)}")
+                
+                self.tracker.log({"train/generator_lr": last_gen_lr}, step=self.step)
+                self.tracker.log({"train/discriminator_lr": last_disc_lr}, step=self.step)
                 mem_stats = torch.cuda.memory_stats()
                 self.tracker.log({
                                 "memory/reserved-bytes": mem_stats["reserved_bytes.all.current"],
@@ -391,20 +428,8 @@ class VideoTokenizerTrainer:
             else:
                 input_video = None
                 is_global_step_update = False
-            if apply_gradient_penalty:
-                gc.collect()
-                # torch.cuda.empty_cache()
-        return is_global_step_update, input_video, recon_output
 
-    def get_accum_batches(self, train_dataloader):
-        accum_batches = []
-        for batch in train_dataloader:
-            accum_batches.append(batch)
-            if len(accum_batches) >= self.accelerator.gradient_accumulation_steps:
-                yield accum_batches
-                accum_batches = []
-        if len(accum_batches):
-            yield accum_batches
+        return is_global_step_update, input_video, recon_output
 
 
     def train(self):
@@ -412,10 +437,10 @@ class VideoTokenizerTrainer:
         self.print_global_rank_0(f"using global batch size: {self.train_dataloader.batch_sampler.batch_size} x {self.accelerator.state.num_processes} x {self.trainer_config.optimizer.grad_accum_size}")
         self.model.train()
         if self.accelerator.process_index == 0:
-            self.time_s = time.time()
+            self.time_s = time.perf_counter()
 
         if self.continue_training:
-            micro_steps_to_skip = (self.step * self.accelerator.gradient_accumulation_steps)//2 % len(self.train_dataloader)
+            micro_steps_to_skip = (self.step * self.accelerator.gradient_accumulation_steps) % len(self.train_dataloader)
 
             skipped_dataloader = self.accelerator.skip_first_batches(self.train_dataloader, num_batches=micro_steps_to_skip)
             num_trained_epochs = self.epoch
@@ -444,23 +469,21 @@ class VideoTokenizerTrainer:
             
             d_s = time.time()
             
-            for accum_batches in self.get_accum_batches(train_dataloader):
+            for batch in train_dataloader:
                 d_e = time.time()
                 self.print_global_rank_0(f">> TIME: [data loading] {d_e - d_s}")
-                for _ in range(2):
-                    for batch in accum_batches:
-                        with self.accelerator.autocast():
-                            if self.step % 100 == 0:
-                                self.accum_duration = 0
-                            is_global_step_update, input_video, recon_output = self.train_step(batch)
-                        self.accelerator.wait_for_everyone()
-                        if is_global_step_update:
-                            if self.step > 0 and self.step % self.trainer_config.logging.validate_every_step == 0:
-                                self.valid_step(valid_data_iter=valid_data_iter)                        
-                                self.model.train()
-                            if self.step > 0 and self.step % self.trainer_config.checkpointing.checkpoint_every_step == 0:
-                                self.save_ckpt(self.step)
-                                self.accelerator.save_state(os.path.join(self.ckpt_base_dir, f"iter_{self.step}"))
+                with self.accelerator.autocast():
+                    if self.step % 100 == 0:
+                        self.accum_duration = 0
+                    is_global_step_update, input_video, recon_output = self.train_step(batch)
+                self.accelerator.wait_for_everyone()
+                if is_global_step_update:
+                    if self.step > 0 and self.step % self.trainer_config.logging.validate_every_step == 0:
+                        self.valid_step(valid_data_iter=valid_data_iter)                        
+                        self.model.train()
+                    if self.step > 0 and self.step % self.trainer_config.checkpointing.checkpoint_every_step == 0:
+                        self.save_ckpt(self.step)
+                        self.accelerator.save_state(os.path.join(self.ckpt_base_dir, f"iter_{self.step}"))
                 d_s = time.time()
 
     def write_recon_video(self, input_video, decoded_output, prefix=""):
@@ -494,26 +517,33 @@ class VideoTokenizerTrainer:
                 all_ema_recon_output = self.accelerator.gather_for_metrics(ema_recon_output)
                 valid_ema_recon_loss = F.mse_loss(all_eval_data, all_ema_recon_output)
                 self.tracker.log({"val/ema_recon_loss": valid_ema_recon_loss.item()}, step=self.step)
+
+            loss_weights = {
+                "recon_loss_weight": 0.0,
+                "quantizer_entropy_loss_weight": 0.0,
+                "quantizer_aux_loss_weight": 0.0
+            }
+
             recon_output, *_ = self.model(
-                eval_data,
-                run_generator=False,
-                run_discriminator=False,
-                apply_gradient_penalty=False,
-                loss_weights={"quantizer_entropy_loss_weight": 0.0, "recon_loss_weight": 0.0, "quantizer_aux_loss_weight": 0.0},
+                forward_mode="reconstruction",
+                input_data=eval_data,
+                calculate_loss=False,
+                loss_weights=loss_weights
             )
             all_recon_output = self.accelerator.gather_for_metrics(recon_output)
             valid_recon_loss = F.mse_loss(all_eval_data, all_recon_output)
             self.tracker.log({"val/recon_loss": valid_recon_loss.item()}, step=self.step)
 
+        sample_index = random.randint(0, all_eval_data.shape[0]-1)
         if self.trainer_config.modal == "video":
-            self.write_recon_video(eval_data[0].cpu(), recon_output[0].cpu())
+            self.write_recon_video(all_eval_data[sample_index].cpu(), all_recon_output[sample_index].cpu())
             if self.use_ema:
-                self.write_recon_video(eval_data[0].cpu(), ema_recon_output[0].cpu(), prefix="ema_")
+                self.write_recon_video(all_eval_data[sample_index].cpu(), all_ema_recon_output[sample_index].cpu(), prefix="ema_")
 
         elif self.trainer_config.modal == "image":
-            self.write_recon_image(eval_data[0].cpu(), recon_output[0].cpu())
+            self.write_recon_image(all_eval_data[sample_index].cpu(), all_recon_output[sample_index].cpu())
             if self.use_ema:
-                self.write_recon_image(eval_data[0].cpu(), ema_recon_output[0].cpu(), prefix="ema_")
+                self.write_recon_image(all_eval_data[sample_index].cpu(), all_ema_recon_output[sample_index].cpu(), prefix="ema_")
         del eval_data, recon_output, ema_recon_output, all_eval_data, all_recon_output, all_ema_recon_output
         # gc.collect()
         # torch.cuda.empty_cache()
@@ -546,9 +576,6 @@ class VideoTokenizerTrainer:
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         self.accelerator.save(unwrapped_model.state_dict(), os.path.join(self.ckpt_base_dir, f"iter_{step}.ckpt"))
         self.accelerator.wait_for_everyone()
-        del unwrapped_model
-        gc.collect()
-        torch.cuda.empty_cache()
 
     def load_ckpt(self, step):
         torch.load(os.path.join(self.ckpt_base_dir, f"iter_{step}.ckpt"))
