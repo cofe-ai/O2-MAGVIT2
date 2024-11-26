@@ -23,11 +23,12 @@ def calculate_entropy_loss(
 ):
     """Calculate the entropy loss."""
     if loss_type == "softmax":
-        target_probs = (affinity.view(-1, affinity.shape[-1]) * inv_temperature).softmax(dim=-1)
-    # log_probs = F.log_softmax(flat_affinity + 1e-5, dim=-1)
+        flat_affinity = affinity.view(-1, affinity.shape[-1]) * inv_temperature
+        target_probs = flat_affinity.softmax(dim=-1)
+        log_probs = F.log_softmax(flat_affinity + 1e-5, dim=-1)
     else:
         raise ValueError("Entropy loss {} not supported".format(loss_type))
-    def calculcate_entropy_items(target_probs, sampling_frac=0.5):
+    def calculcate_entropy_items(target_probs, log_probs, sampling_frac=1.0):
         
         # sampling frac = 0.8
         if sampling_frac < 1.0:
@@ -35,7 +36,7 @@ def calculate_entropy_loss(
             num_sampled_tokens = int(sampling_frac * num_tokens)
             rand_mask = torch.randn(num_tokens).argsort(dim = -1) < num_sampled_tokens
             target_probs = target_probs[rand_mask]
-            # log_probs = log_probs[rand_mask]
+            log_probs = log_probs[rand_mask]
         else:
             target_probs = target_probs
 
@@ -47,15 +48,15 @@ def calculate_entropy_loss(
         else:
             avg_probs = avg_probs
         avg_entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-5))
-        sample_entropy = -torch.mean(torch.sum(target_probs * torch.log(target_probs+1e-5), dim=-1))
+
+        sample_entropy = -torch.mean(torch.sum(target_probs * log_probs, dim=-1))
         return sample_entropy, avg_entropy
     
-    sample_entropy, avg_entropy = calculcate_entropy_items(target_probs)
+    sample_entropy, avg_entropy = calculcate_entropy_items(target_probs, log_probs)
 
     loss = (sample_minimization_weight * sample_entropy) - (
         batch_maximization_weight * avg_entropy
     )
-    del target_probs
     return loss, sample_entropy, avg_entropy
 
 def lecam_reg(real_pred, fake_pred, ema_real_pred, ema_fake_pred):
@@ -102,15 +103,15 @@ def resnet50_imaagenet1k_v2_transform(img):
     return img
 
 def calculate_perceptual_loss(real_perceptual_inputs, fake_perceptual_inputs, model):
-    
+    model.eval()
     # num_frames = real_perceptual_inputs.shape[0]
     # picked_indices = torch.randint(0, num_frames, [4])
     
     # real_perceptual_inputs = pick_video_frame(real_perceptual_inputs, picked_indices)
     # fake_perceptual_inputs = pick_video_frame(fake_perceptual_inputs, picked_indices)
 
-    # real_perceptual_inputs = resnet50_imaagenet1k_v2_transform(real_perceptual_inputs)
-    # fake_perceptual_inputs = resnet50_imaagenet1k_v2_transform(fake_perceptual_inputs)
+    real_perceptual_inputs = resnet50_imaagenet1k_v2_transform(real_perceptual_inputs)
+    fake_perceptual_inputs = resnet50_imaagenet1k_v2_transform(fake_perceptual_inputs)
     real_perceptual_logits = model(real_perceptual_inputs)
     fake_perceptual_logits = model(fake_perceptual_inputs)
     return F.mse_loss(real_perceptual_logits, fake_perceptual_logits)
